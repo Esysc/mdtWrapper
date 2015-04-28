@@ -1,0 +1,1354 @@
+#!/bin/bash  
+
+
+#
+#
+# mdtWrapper v 2.0
+# - Added ipxe configuration to boostrap from dhcpd directly
+# ipxe boot script added the dispatcher part
+# This script is intended to be a wrapper for MDT and tftp server.
+# It runs on drbl server
+# It manage the CustomSettings ini file , confnet customisation script and finally it write the boot file in tftp directory
+# It accepts arguments from DB and is run totally from a daemon that check periodically for machine job
+# The script can be run manually, it accepts a minimum of two arguments: 
+# - Task ID (as defined in mdt database)
+# - Rack position or directly the ip address of client (need to be know)
+# 
+# Debug:
+# code 299 no clients found on rack position declared
+# Author ACS 2014
+
+
+#Source the DRBL functions dir
+
+DRBL_SCRIPT_PATH="${DRBL_SCRIPT_PATH:-/usr/share/drbl/bin}"
+
+#Define the web services where to send events
+#the form is WEB1, WEB2, WEB(n)
+#Add the perl section for each service in 'log' function
+INVSERVER="10.0.129.149"
+
+
+WINPE="WINPE1.0"
+BASE="/home/partimag"
+MDT="$BASE/MDT/Control"
+WWWBOOT="/var/www/BOOT"
+nocheck=0
+# Gets the cyclades and swithes values from DB
+getEnv() {
+
+Rack=$(echo $rackPosition | awk -F "_" '{print $1}')
+Shelf=$(echo $rackPosition | awk -F "_" '{print $2}')
+Rack=$(echo $Rack | sed 's/[^0-9]//g')
+#Rack=$(echo  "${Rack##${Rack%%?}}")
+Shelf=$(echo  "${Shelf##${Shelf%%?}}")
+
+
+log INFO "About to download env values from http://10.0.205.204/SPOT/provisioning/api/sysprodracksmappings?Rack_Equals=$Rack&Shelf_Equals=$Shelf"
+
+URI="http://10.0.205.204/SPOT/provisioning/api/sysprodracksmappings?Rack_Equals=$Rack&Shelf_Equals=$Shelf"
+results=$(
+perl - "$URI"  <<'_HERE_'
+use Time::Piece;
+use integer;
+use POSIX qw(strftime);
+use Backticks;
+use Data::Dumper;
+use Sys::Hostname;
+use Socket;
+use LWP::UserAgent;
+use LWP::Simple;
+use strict;
+use warnings;
+use integer;
+use Switch;
+use JSON ;
+use feature qw(switch);
+use HTTP::Cookies;
+use HTTP::Request;
+use LWP;
+use File::Path qw{mkpath};
+
+my $WEB = shift;
+my $lwp = LWP::UserAgent->new(
+                        timeout               => 10,
+);
+my $req = HTTP::Request->new( 'GET', "$WEB" );
+my $resp = $lwp->request($req);
+my $decoded = decode_json($resp->content);
+#my %recursive = ( $decoded->{rows} );
+#print $req->as_string;
+#print Dumper $resp;
+#print Dumper $decoded->{rows}->[0]->{switchip};
+my $switchip = $decoded->{rows}->[0]->{switchip};
+my $bootpip = $decoded->{rows}->[0]->{bootpip};
+my $cycladesip = $decoded->{rows}->[0]->{cycladesip};
+my $cycladesport = $decoded->{rows}->[0]->{cycladesport};
+my $switchport = $decoded->{rows}->[0]->{switchport};
+my $rack = $decoded->{rows}->[0]->{rack};
+my $shelf = $decoded->{rows}->[0]->{shelf};
+print "$switchip\n$bootpip\n$cycladesip\n$cycladesport\n$switchport\n$rack\n$shelf\n";
+_HERE_
+)
+#> /dev/null 2>&1
+counter=1
+for i in $results
+do
+case $counter in
+1) switchip=$i;;
+2) bootpip=$i;;
+3) cycladesip=$i;;
+4) cycladesport=$i;;
+5) switchport=$i;;
+6) rack=$i;;
+7) shelf=$i;;
+esac
+counter=$(($counter + 1))
+done
+#Prepare the string for parsing
+CYCLADES="rack"$rack"_shelf$shelf $cycladesip:$cycladesport"
+case $rack in
+2) switch_maps="rack$rack $switchip
+shelf$rack$shelf $switchport"
+;;
+*) switch_maps="rack$rack $switchip
+shelf$shelf $switchport"
+;;
+esac
+
+log INFO "The env values for cyclades are $CYCLADES and for switches $switch_maps"
+}
+
+
+# Usage function
+usage () {
+log INFO "usage $0 -a [wintz]
+-pos [rack_shelf | client ip]
+-g [default gateway]
+-h [hostname]
+-d [workgroup]
+-t [task ID]
+-ip [ip address]
+-n [netmask]
+-p [product key]
+-r [customer release(s) (separated by comma, ex release1,release2, etc.) ]
+-s [sales order number]
+-cus [customer acr]
+-iloip [ilo ip address]
+-ilonm [ilo netmask]
+-radmin [0|1 (default to 0 - not activate ]"
+log INFO "IMM and ILO are threated same way"
+log INFO "Only 2 parameter are mandatory: -pos [rack_shelf | client IP] -t [task ID]. Note that if taskID is a clonezilla image the wrapper recognize automatically it"
+log INFO "The parameter -pos can specify either the rack shelf position and directly the ip client (usefull to install virtual machines)"
+log WARN "Note that if the server is a Proliant either a IBM system X, the mirror is automatically built if two disks are found"
+log WARN "If only one argument is given [-pos rackposition] it checks for the existance of the pxe client"
+check_args
+}
+
+# Checks if the mandatory arguments are all here
+check_args() {
+#put here the mandatory params
+([[ -z "$taskID"  || -z "$rackPosition" ]] ) && rackPosition="usage"  && log ERROR "Some mandatory parameters missing!!!!!" && log INFO "Type $0 without arguments to grab usage." && exit 1
+ valid_ip $ipaddress && [ "$ERROR" -ne 0 ] && log ERROR "Ip address not valid" && exit 1
+ valid_ip $netmask && [ "$ERROR" -ne 0 ] && log ERROR "Netmask not valid" && exit 1
+ valid_ip $gateway && [ "$ERROR" -ne 0 ] && log ERROR "Gateway not valid" && exit 1
+ #check valid client
+nimclient=`ssh 10.0.205.205 "lsnim -c machines | grep $rackPosition"`
+valid_ip $rackPosition
+ [[ -z "$nimclient" ]] &&  [ $ERROR -ne 0 ]   && log ERROR "Hey, this client doesn't exists ...! check your spelling" && exit 1
+ #check valid TaskID
+( [[ ! -d $MDT/$taskID ]] && [[ ! -d $BASE/$taskID ]] ) && log ERROR "The taskID $taskID is not valid, please check the name. Possible values are for MDT based jobs are:" && log INFO "`for dir in $(ls -d $MDT/*/);do echo $(basename $dir);done`" && log ERROR "And for clonezilla here you are the images available:" && log INFO "`for dir in $(ls -d $BASE/*/); do if [ -f $dir/disk ]; then echo $(basename $dir); fi; done`" && exit 1
+}
+
+destroyDisks () {
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+log WARN "About to clean all partitions on local disk(s)................."
+sshExe $clientIP "destroyDisks" 2>&1 >/dev/null
+log INFO "Finish cleaning local disk(s)"
+}
+# Function to find ip address or mac address of given rack shelf
+# should be called with a rack shelf and kind of value you want to find as argument
+
+findIPMAC () {
+rack=$1
+value=$2
+
+#check if rack caontains an ip address 
+#if so, we can continue directly to grab the MAC if asked
+valid_ip $rack 
+if [ "$ERROR" -eq 0 ]; then 
+log DEBUG "I'm here"
+ip_client=$rack
+client_mac=$(arp -n | grep -w "$ip_client" |  awk '{print $3}')
+if [[ -z "$client_mac" ]]; then
+log ERROR "I didn't find any client mac address for IP: $rack!"
+exit 1
+fi
+client_mac=`echo "${client_mac,,}"`
+if [[ "$value" == "IP" ]]; then
+                                                        echo  -e  $ip_client \\n
+                                                        else
+                                                                if [[ "$value" == "MAC" ]]; then
+                                                                echo -e $client_mac \\n
+                                                                else
+                                                                log ERROR "MANDATORY param $value is missing or not valid"
+                                                                fi
+                                                        fi
+
+
+else
+
+switch=$(echo $rack | awk -F "_" '{print $1}')
+floor=$(echo $rack | awk -F "_" '{print $2}')
+# end of data collection
+
+# begin of switch_maps parsing
+
+switch_ip=$(echo "$switch_maps" | grep -w "$switch" | awk  '{print $2}')
+# this needed to map switch 2 as it is different from the others
+        if [[ "$switch" == "rack2" ]] ; then floor=`echo $floor | sed 's/...../&2/g;s/2$//'` ; fi
+switch_port=$(echo "$switch_maps" | grep $floor | awk  '{print $2}')
+# end switch map parsing
+# find the macs connected:
+client_mac=$(perl /usr/sbin/switchlabel.pl $switch_ip public | grep -w "port $switch_port" | awk '{print $2}' )
+# transform lowercase for arp output
+if [[ -z "$client_mac" ]]; then
+log ERROR "I didn't find any client on the rack shelf: $rackPosition!"
+exit 1
+fi
+client_mac=`echo "${client_mac,,}"`
+#echo $client_mac
+# find the ip for the client
+        if [[ ! "$client_mac" == "" ]]; then
+                for i in $client_mac; do
+                ip_client=`arp -n | grep  -w "$i" | awk '{print $1}'`
+                        if  [[ ! "$ip_client" == "" &&  ! "$ip_client_ctrl" =~ "$ip_client" ]]; then
+                        for b in $ip_client; do
+                        sshpass -p Superuser  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 root@$b exit  >> /dev/null 2>&1
+                        if [ $? -eq 0 ]; then
+							if [[ "$value" == "IP" ]]; then
+							echo  -e  $b \\n
+							else
+								if [[ "$value" == "MAC" ]]; then
+								echo -e $i \\n
+								else
+								log ERROR "MANDATORY param $value is missing or not valid"
+								fi
+							fi
+                        fi
+                        done
+                        ip_client_ctrl=$ip_client_ctrl" "$ip_client
+                        fi
+                done
+        else
+        return 1
+        fi
+fi
+}
+
+
+#function append to cs.ini
+append_csini() {
+CRUD=`which crudini`
+csini="/home/partimag/MDT/Control/CustomSettings.ini"
+#Get the ip address
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+if [[ $? -eq 1 ]] || [[ -z "$clientIP" ]]
+then
+log ERROR "I didn't find any client on that rack $rackPosition"
+  exit 299
+fi
+#Get and transform mac address uppercase
+MAC=$(findIPMAC $rackPosition "MAC" 2>/dev/null | head -1)
+
+if [[ $? -eq 1 ]] || [[ -z "$MAC" ]]
+then
+log ERROR "Error trying to get mac address of client on  rack $rackPosition"
+  exit 299
+fi
+
+DISKSCOUNT=$(sshExe $clientIP "lsblk -i -d -n -e 1,11 | wc -l")
+
+hwaddr=$(echo $MAC | tr 'a-z' 'A-Z') 
+log DEBUG "$rackposition and $clientIP"
+if [[ $rackPosition == *$clientIP* ]]; then
+Rack="Virtual"
+Shelf=$clientIP
+else
+# Get the rack and shelf variable
+
+Rack=$(echo $rackPosition | awk -F "_" '{print $1}')
+Shelf=$(echo $rackPosition | awk -F "_" '{print $2}')
+fi
+log INFO "Setting Rack equal to '$Rack' and Shelf to '$Shelf'"
+#Remove the section if already exists to create a new one
+log INFO "Deleting the $hwaddr section if already existing"
+$CRUD --del $csini $hwaddr
+
+# Create the csini
+
+setINI="$CRUD --set $csini $hwaddr"
+$setINI TaskSequenceID "$taskID"
+$setINI TimeZoneName "$wintz"
+$setINI ComputerName "$hostname"
+$setINI OSDComputerName "$hostname"
+$setINI OSDAdapterCount "$NETCOUNT"
+$setINI OSDAdapter0EnableWINS TRUE
+$setINI OSDAdapter0TCPIPNetBiosOptions 0
+$setINI OSDAdapter0MacAddress "$hwaddr"
+$setINI SDAdapter0GatewayCostMetrics Automatic
+$setINI OSDAdapter0EnableTCPIPFiltering TRUE
+$setINI OSDAdapter0EnableLMHosts TRUE
+$setINI OSDAdapter0EnableFullDNSRegistration TRUE
+$setINI OSDAdapter0EnableDNSRegistration TRUE
+$setINI OSDAdapter0Name CTRL
+$setINI JoinWorkgroup "$domain"
+$setINI CPU "$NUMPROC"
+$setINI So "$salesOrder"
+$setINI Rack "$Rack"
+$setINI Shelf "$Shelf"
+$setINI disksCount "$DISKSCOUNT"
+$setINI firmware "$MANUFACTURER"
+$setINI NetIntCount "$NETCOUNT"
+$setINI Data "configuredIP : $ipaddress"
+$setINI OSDRadmin $radmin
+
+if [[ ! -z "$release" ]]; then
+#The path to send to MDT include the customer ACR (Windows UNC PATH)
+	findCustACR
+	OLDIFS=$IFS
+	IFS=','
+	releases=''
+	for i in $release
+	do
+		releases="$releases$ACR\\$i,"
+	done
+	IFS=$OLDIFS
+	$setINI OSDCustomerRelease "$releases"
+	
+fi
+
+
+#This is doing nothing but I leave for backwards scope
+
+CS="[$hwaddr]
+TaskSequenceID=$taskID
+#TimeZoneName=$wintz
+ComputerName=$hostname
+#OverrideProductKey=$productKey
+OSDComputerName=$hostname
+OSDAdapterCount=1
+OSDAdapter0EnableWINS=TRUE
+OSDAdapter0TCPIPNetBiosOptions=0
+OSDAdapter0MacAddress=$hwaddr
+OSDAdapter0GatewayCostMetrics=Automatic
+OSDAdapter0EnableTCPIPFiltering=TRUE
+OSDAdapter0EnableLMHosts=TRUE
+OSDAdapter0EnableFullDNSRegistration=TRUE
+OSDAdapter0EnableDNSRegistration=TRUE
+OSDAdapter0Name=CTRL
+JoinWorkgroup=$domain
+OSDCustomerRelease=$release
+So=$salesOrder
+Rack=$Rack
+Shelf=$Shelf
+disksCount=$DISKCOUNT
+firmware=$MANUFACTURER
+NetIntCount=1
+; Json format without doubles quotes
+Data=configuredIP : $clientIP
+"
+#sanitaze the file from blank lines
+log INFO "Removing blank lines from $csini"
+grep '[^[:blank:]]' < $csini > /tmp/$hwaddr
+tr -d $'\r' < /tmp/$hwaddr > $csini
+rm /tmp/$hwaddr
+}
+
+
+#Function log for better printing
+
+log() {
+local level=${1?}
+shift
+local code= line="[$(date '+%F %T')] $level: $*"
+if [ -t 2 ]
+then
+case "$level" in
+INFO) code=36 ;;
+DEBUG) code=30 ;;
+WARN) code=33 ;;
+ERROR) code=31 ;;
+*) code=37 ;;
+esac
+echo -e "\e[${code}m${line}\e[0m"
+else
+echo "$line"
+fi >&2
+
+#LOG to web services
+#Create one section for each web service
+REST='{"title":"mdtWrapper | '$rackPosition'","content":"'$line'","userid":"'`whoami`'","date":"'`date`'"}'
+
+(
+perl - "$REST"  <<'_HERE_'
+use integer;
+use POSIX qw(strftime);
+use Backticks;
+use Data::Dumper;
+use Sys::Hostname;
+use Socket;
+use LWP::UserAgent;
+use LWP::Simple;
+use strict;
+use warnings;
+use integer;
+use Switch;
+use JSON ;
+use feature qw(switch);
+use HTTP::Cookies;
+use HTTP::Request;
+use LWP;
+use File::Path qw{mkpath};
+my $uri = "http://10.0.205.204/SPOT/provisioning/api/events";
+my $REST = shift;
+my $lwp = LWP::UserAgent->new(
+                        timeout               => 10,
+);
+my $req = HTTP::Request->new( 'POST', "$uri" );
+$req->content($REST);
+my $resp = $lwp->request($req);
+print $req->as_string;
+#print Dumper $resp;
+_HERE_
+)  2>&1 >/dev/null 
+
+if [[ ! -z $rackPosition && ! -z $salesOrder ]]; then createMonitorRecord "$line"; fi
+
+}
+
+
+SEND () {
+
+
+perl -e '
+use integer;
+use POSIX qw(strftime);
+use Backticks;
+use Data::Dumper;
+use Sys::Hostname;
+use Socket;
+use LWP::UserAgent;
+use LWP::Simple;
+use strict;
+use warnings;
+use integer;
+use Switch;
+use JSON ;
+use feature qw(switch);
+use HTTP::Cookies;
+use HTTP::Request;
+use LWP;
+my $REST = shift;
+my $uri = shift;
+my $lwp = LWP::UserAgent->new(
+                        timeout               => 10,
+);
+my $req = HTTP::Request->new( "PUT", "$uri" );
+$req->content($REST);
+my $resp = $lwp->request($req);
+print $req->as_string;
+#print Dumper $resp;
+' "$REST" "$URI"
+
+
+}
+
+createMonitorRecord () {
+ Status="$1"
+ subid="$rackPosition"
+ subid=`echo $rackPosition | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'`
+ if [[ "$subid" == "" ]]; then
+ subid=$rackPosition
+ else
+ subid=$rackPosition"_"
+ fi
+ PK="["$salesOrder"]["$subid"]"
+ URI="http://10.0.205.204/SPOT/provisioning/api/provisioningnotifications/$PK"
+
+                         REST="{
+        \"notifid\":\"$PK\",
+        \"hostname\":\"$hostname\",
+        \"installationip\":\"vnc://$clientIP\",
+        \"configuredip\":\"$ipaddress\",
+        \"status\":\"<b>$Status</b>\",
+        \"progress\":\"$PROGRESS\",
+        \"image\":\"$taskID\",
+        \"firmware\":\"$MANUFACTURER\",
+        \"ram\":\"$RAM_tot\",
+        \"cpu\":\"$NUMPROC\",
+        \"diskscount\":\"$DISKCOUNT\",
+        \"netintcount\":\"$NETCOUNT\",
+        \"model\":\"$MODEL\",
+        \"serial\":\"$MACHSERIAL\",
+        \"os\":\"Windows\"
+        }"
+        SEND 2>&1 >/dev/null
+
+
+}
+
+#Create pxe boot files
+
+
+
+
+bootPxe () {
+#Get and transform mac for bootfile naming 
+
+MAC=$(findIPMAC $rackPosition "MAC" 2>/dev/null | head -1)
+
+if [[ $? -eq 1 ]] || [[ -z "$MAC" ]]
+then
+log ERROR "Error trying to get mac address of client on  rack $rackPosition"
+  exit 299
+fi
+
+
+MACSyslinux=01-${MAC//:/-}
+MACGrub=01-${MAC}
+bootSyslinux="/tftpboot/nbi_img/pxelinux.cfg/$MACSyslinux"
+bootGrub="/tftpboot/nbi_img/pxelinux.cfg/$MACGrub"
+bootIpxe="$WWWBOOT/$MAC"
+
+syslinuxCFG="default vesamenu.c32
+timeout 70
+prompt 0
+noescape 1
+MENU MARGIN 5
+MENU BACKGROUND nagra.jpg
+# Set the color for unselected menu item and timout message
+MENU COLOR UNSEL 7;32;41 #c0000090 #00000000
+MENU COLOR TIMEOUT_MSG 7;32;41 #c0000090 #00000000
+MENU COLOR TIMEOUT 7;32;41 #c0000090 #00000000
+MENU COLOR HELP 7;32;41 #c0000090 #00000000
+say **********************************************
+say Welcome to WINPE.
+say Booting in WINPE
+say **********************************************
+# Allow client to edit boot parameters
+ALLOWOPTIONS 1
+# simple menu title
+MENU TITLE NAGRAVISION (http://www.nagra.com)
+label boot ipxe
+MENU DEFAULT
+MENU LABEL boot ipxe
+kernel ipxe.lkrn
+append  dhcp && chain http://10.0.205.203/boot.ipxe
+"
+grubCFG='
+if [ "${grub_platform}" = "efi" ]; then
+menuentry "WINPE '$taskID'" --class windows {
+chainloader  /ipxe64.efi
+}
+
+else
+
+menuentry "WINPE '$taskID'" --class windows {
+#set root=http,10.0.129.101
+linux16 memdisk iso raw
+initrd16   ipxe.iso
+}
+fi
+'
+
+ipxeCFG='
+<?php
+echo "  item --key r '$taskID'   (r) '$taskID' \n";
+echo "  item\n";
+echo "  choose --default '$taskID' --timeout 10000 target && goto \${target} || goto cancelled\n";
+echo "  :'$taskID'  \n";
+
+echo "  :'$taskID'\n";
+
+echo "  imgfree\n";
+switch($_GET["platform"]) {
+        case "efi":
+                echo "  kernel \${remote-root}\${winpe-files}/wimboot\n";
+                echo "  initrd \${remote-root}\${winpe-files}/\${arch}/EFI/Microsoft/Boot/BCD BCD\n";
+                echo "  initrd \${remote-root}\${winpe-files}/\${arch}/Boot/boot.sdi boot.sdi\n";
+                echo "  initrd -n boot.wim \${remote-root}\${winpe-files}/LiteTouchPE_x64.wim boot.wim\n";
+                 echo "  boot || goto failed\n";
+                break;
+        default:
+                echo "  kernel \${remote-root}\${winpe-files}/wimboot\n";
+                echo "  initrd \${remote-root}\${winpe-files}/\${arch}/Boot/BCD      BCD\n";
+                echo "  initrd \${remote-root}\${winpe-files}/\${arch}/Boot/boot.sdi boot.sdi\n";
+                echo "  initrd \${remote-root}\${winpe-files}/LiteTouchPE_x64.wim         boot.wim\n";
+                 echo "  boot || goto failed\n";
+                break;
+}
+echo " :failed\n";
+$jsonDash = array("status" => "BOOT FAILED!!! May be some files has not been found. Check within a KVM", "progress" => "0");
+updateDashboard($jsonDash);
+
+
+?>
+'
+
+
+
+#Create the boot files
+echo "$syslinuxCFG" > $bootSyslinux
+echo "$grubCFG" > $bootGrub
+echo "$ipxeCFG" > $bootIpxe
+}
+
+#Fucntion to create the confnet files for clients
+
+createConfnet () {
+
+
+#Get and transform mac address uppercase
+MAC=$(findIPMAC $rackPosition "MAC" 2>/dev/null | head -1)
+
+if [[ $? -eq 1 ]] || [[ -z "$MAC" ]]
+then
+log ERROR "Error trying to get mac address of client on  rack $rackPosition"
+  exit 299
+fi
+
+
+hwaddr=$(echo $MAC | tr 'a-z' 'A-Z') 
+confnetFile="/var/www/Confnet/"$hwaddr"_confnet.bat"
+
+confnetContent="
+REM
+REM This script do final configuration
+REM Scope 1 : change ip address
+REM Scope 2 : set interface name
+REM Scope 3 : Eventually activate windows
+REM Scope 4 : Separate exe files from all the rest per release
+
+
+
+NetSh Advfirewall set allprofiles state off
+NetSh winhttp reset proxy
+reg add HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer /v HideSCAHealth /t REG_DWORD /d 0x1 /f
+"
+if [[ $radmin -eq 1  && $cz -eq 1 ]] ; then
+confnetContent="$confnetContent
+%windir%\\SysWOW64\\rserver30\\Rserver3.exe /stop
+%windir%\\SysWOW64\\rserver30\\Rserver3.exe /start
+
+"
+fi
+confnetContent="$confnetContent
+sc config lmhosts start= auto
+sc start lmhosts
+
+if exist C:\\Nagravision\\delivery (
+cd C:\\Nagravision\\delivery
+for  /D  %%d IN (C:\\Nagravision\\delivery\\*) DO (
+				if exist %%d (
+                echo \"Creating %%d.GUI **********************\"
+
+                mkdir %%d.GUI
+
+                                cd %%d
+                                FOR  /R  %%e IN (*.exe) DO (
+                                echo \"Moving %%e in %%d.GUI **********************\"
+                                move /Y %%e %%d.GUI
+                                )
+								)
+
+                )
+
+)
+
+"
+  if [[ ! -z "$productKey" ]]; then
+
+confnetContent="$confnetContent
+echo \"Activating Windows..........\"
+net time \\\\mdt01 /SET /YES
+cscript /b %windir%\\system32\\slmgr.vbs -upk
+cscript /b %windir%\\system32\\slmgr.vbs -ipk $productKey
+cscript /b %windir%\\system32\\slmgr.vbs -ato
+
+"
+
+fi
+
+confnetContent="$confnetContent
+echo \"About to set interface name and ip address **********************\"
+
+REM This is done in cs.ini
+REM netsh interface set interface name = \"Local Area Connection\" newname = \"CTRL\"
+"
+if [[ ! -z "$ipaddress" ]] && [[ ! -z "$netmask" ]]; then
+
+confnetContent="$confnetContent
+wmic nicconfig where MACAddress=\"$hwaddr\" call EnableStatic (\"$ipaddress\"), (\"$netmask\")
+"
+fi
+
+if [[ ! -z "$gateway" ]]; then
+confnetContent="$confnetContent
+wmic nicconfig where MACAddress=\"$hwaddr\" call SetGateways (\"$gateway\"), (\"1\")
+"
+fi
+
+confnetContent="$confnetContent
+tzutil /s \"$wintz\"
+ipconfig /flushdns
+
+if exist C:\\bginfo (
+echo \"About to update its background infos **********************\"
+
+CALL C:\\bginfo\\bginfo.bat
+)
+"
+if [[ ! -z $salesOrder ]]; then
+data=`date`
+confnetContent="$confnetContent
+echo Installation number: $salesOrder performed on $data > C:\Windows\syp_log
+"
+fi
+confnetContent="$confnetContent
+DEL \"%~f0\"
+shutdown -r -t 190
+"
+#Write the confnet file on server
+ACTION=$(echo "$confnetContent" > $confnetFile)
+
+if [[ $? -ne 0 ]] 
+then
+log WARN "Cannot write confnet file for final customisation. Reason: $ACTION"
+
+  
+fi
+
+}
+
+
+# Scp  function
+scpExe () {
+# $1 client ip
+#
+# $2 source file
+# $3 target file
+# No password required because we run on drbl server
+
+scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t $2 root@$1:$3
+if [[ $? -ne 0 ]]
+then
+log ERROR "Cannot scp $2 file to client, every further action will be not possible so I exit right now!"
+exit 299
+fi
+
+
+}
+sshExe() {
+# $1 client ip
+# 
+# $2 command or function
+# No password required because we run on drbl server
+ACTION=$(ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t root@$1 " $2")
+if [[ $? -ne 0  ]]
+then
+if [[ ! -z $ACTION ]]; then
+log ERROR "Cannot ssh to client $1 to execute command $2 , every further action will be not possible so I exit right now!"
+echo $ACTION
+fi
+fi
+echo $ACTION
+}
+
+# check IP address function
+valid_ip() {
+ERROR=0
+    oldIFS=$IFS
+    IFS=.
+    set -f
+    set -- $1
+    if [ $# -eq 4 ]
+    then
+      for seg
+      do
+        case $seg in
+            ""|*[!0-9]*) ERROR=1;break ;; ## Segment empty or non-numeric char
+            *) [ $seg -gt 255 ] && ERROR=2 ;;
+        esac
+      done
+    else
+      ERROR=3 ## Not 4 segments
+    fi
+    IFS=$oldIFS
+    set +f
+    return $ERROR
+}
+
+# Function to configure IBM servers
+
+checkIBM () {
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+#check if systemX
+check=$(sshExe $clientIP "dmidecode -s system-manufacturer | grep  IBM ||  echo 'NOK'")
+log WARN "Check IBM result: $check"
+if [[  "$check" != *"NOK"* ]]; then
+echo "OK"
+else
+echo "NOK"
+fi
+
+
+}
+
+setIBMRaid () {
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+TEMPLATE=$1
+#execute the raid configuration
+log INFO "Executing the raid configuration using template $TEMPLATE"
+Raid=$(sshExe $clientIP "/usr/bin/praid -f:/home/partimag/IBMRAIDTEMPLATES/$TEMPLATE -e2 -e3 -y -v:0")
+if [ $? -ne 0 ]; then
+	log ERROR "Something gone wrong. The error message is: $Raid"
+	log ERROR "I'm exiting right now"
+	exit 299
+	killall -9 $0
+fi
+}
+
+setIMM () {
+
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+IMM_hostname="IMM$hostname"
+IMM_ip=$iloipaddress
+IMM_mask=$ilonetmask
+IMM_gw=$gateway
+log INFO "Settings for IMM are: $IMM_ip $IMM_mask $IMM_gw $IMM_hostname"
+log INFO "Launching the command sshExe $clientIP /usr/sbin/set_imm.sh $IMM_ip $IMM_mask $IMM_gw $IMM_hostname . It takes some time to complete"
+Set=$(sshExe $clientIP "/usr/sbin/set_imm.sh $IMM_ip $IMM_mask $IMM_gw $IMM_hostname")
+log INFO "Finished to set IMM values"
+}
+
+
+
+#function to check if EliteDesk desktop machine
+
+checkEliteDesk () {
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+#check if EliteDesk
+check=$(sshExe $clientIP "dmidecode -s system-product-name | grep  EliteDesk ||   echo 'NOK'")
+log WARN "Check EliteDesk result: $check"
+if [[  "$check" != *"NOK"* ]]; then
+echo "OK"
+else
+echo "NOK"
+fi
+}
+
+
+#Functions to configure proliant servers 
+
+checkProliant () {
+
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+#check if proliant
+check=$(sshExe $clientIP "dmidecode -s system-product-name | grep  ProLiant ||  echo 'NOK'")
+log WARN "Check Proliant result: $check"
+if [[  "$check" != *"NOK"* ]]; then
+echo "OK"
+else
+echo "NOK"
+fi
+
+}
+
+setILO () {
+
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+ILO_hostname="ILO$hostname"
+ILO_pwd="Superuser"
+ILO_ip=$iloipaddress
+ILO_mask=$ilonetmask
+ILO_gw=$gateway
+log INFO "Settings for ilo are: $ILO_ip $ILO_mask $ILO_gw $ILO_pwd $ILO_hostname"
+log INFO "Launching the command sshExe $clientIP /usr/sbin/set_ilo.sh $ILO_ip $ILO_mask $ILO_gw $ILO_pwd $ILO_hostname"
+Set=$(sshExe $clientIP "/usr/sbin/set_ilo.sh $ILO_ip $ILO_mask $ILO_gw $ILO_pwd $ILO_hostname")
+log INFO "Results for script: $Set"
+}
+
+
+setProliantMirror () {
+#Get the client IP
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+#Check if there are two disks
+declare -i Disks
+Results=`sshExe $clientIP "hpacucli ctrl all  show config | grep physicaldrive | wc -l"`
+Disks=$(echo $Results | sed 's/[^0-9]*//g')
+log INFO "Found $Disks physical disks on system"
+if [[ $Disks -eq 2 ]]; then
+log WARN "Building the mirror"
+Raid=$(sshExe $clientIP "hpacuscripting -reset -i /home/partimag/HPRAIDTEMPLATES/acuoutput1.ini")
+if [ $? -ne 0]; then
+        ERR="`cat error.ini`"
+        log WARN "The first applied template gives an error: $ERR . I'm going to apply the second one....."
+        Raid=$(sshExe $clientIP "hpacuscripting -reset -i /home/partimag/HPRAIDTEMPLATES/acuoutput2.ini")
+        if [ $? -ne 0]; then
+                log ERROR "I have two physical disks, but I could'nt build a mirror as asked. I'm exit right now"
+		exit 299
+                killall -9 $0
+        fi
+fi
+log INFO "Mirroring done! $Raid"
+fi
+}
+
+#Function to clone winpe on HDD to solve ipxe illegal opcode on Proliant servers
+clonePEonHDD () {
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+log WARN "Cloning $WINPE on sda avoiding so the illegal opcode issue on certain machines"
+sshExe $clientIP "/usr/sbin/ocs-sr -l en_US.UTF-8  --nogui --batch -g auto -e1 auto -e2 -r -icds --clone-hidden-data -p reboot restoredisk $WINPE sda  > /dev/null 2>&1" 
+if [ $? -ne 0 ]; then
+log ERROR "Cloning ERROR. I exit right now. You can check errors directly on client (ssh root@$clientIP)"
+exit 199
+fi
+}
+
+#cloenzilla wrapper
+clonezillaWrapper () {
+
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+log WARN "Cloning the image $taskID on $clientIP"
+CLONE=`sshExe $clientIP "/usr/sbin/ocs-sr -l en_US.UTF-8  --nogui --batch -g auto -e1 auto -e2 -r -icds --clone-hidden-data -p command restoredisk $taskID sda  > /dev/null 2>&1"`
+if [ $? -eq 0 ]; then
+log WARN "Cloning appeared successfull but i have no control on it. I'm going to next action"
+
+log INFO "Copying necessary files......"
+mountSystem $clientIP
+copyFiles $clientIP
+if [[ ! -z "$release" ]]; then
+log INFO "Downloading release. It can takes some time"
+downloadRelease  $clientIP
+fi
+sshExe $clientIP "/sbin/reboot"
+else
+log ERROR "Cloning ERROR. I exit right now. You can check errors directly on client (ssh root@$clientIP)"
+exit 199
+fi
+
+
+}
+
+
+
+mountSystem () {
+clientIP=$1
+target="/mnt/windows/Nagravision/delivery"
+PARTITION="/dev/sda2"
+if  $(sshExe $clientIP "mount | grep -q $PARTITION");
+then
+log WARN  "Partition still mounted, unmounting........"
+sshExe $clientIP "umount $PARTITION"
+fi
+log WARN  "mounting ${PARTITION} on /mnt/windows"
+sshExe $clientIP "mkdir -p /mnt/windows; mount -t ntfs $PARTITION /mnt/windows; mkdir -p $target"
+}
+
+copyFiles () {
+clientIP=$1
+#Get and transform mac address uppercase
+MAC=$(findIPMAC $rackPosition "MAC" 2>/dev/null | head -1)
+
+if [[ $? -eq 1 ]] || [[ -z "$MAC" ]]
+then
+log ERROR "Error trying to get mac address of client on  rack $rackPosition"
+  exit 299
+fi
+hwaddr=$(echo $MAC | tr 'a-z' 'A-Z')
+confnetFile="/var/www/Confnet/"$hwaddr"_confnet.bat"
+
+target="/mnt/windows/Nagravision/delivery"
+log INFO "Copying necessary files"
+scpExe $clientIP "/var/www/Confnet/$confnetfile" "/mnt/windows/confnet.bat"
+sshExe $clientIP "cp $BASE/softwindows/dhcp.vbs $target; cp $BASE/MDT/Scripts/registry.reg $target; cp -r $BASE/softwindows/bginfo /mnt/windows/; cp -r $BASE/Nagravision/* /mnt/windows/Nagravision/; mkdir -p /mnt/windows/Windows/Setup/Scripts;
+cat << EOF > /mnt/windows/Windows/Setup/Scripts/Run_once.cmd
+@ech0 off
+call C:\\confnet.bat
+del Run_once.cmd
+EOF
+"
+
+}
+
+downloadRelease () {
+clientIP=$1
+target="/mnt/windows/Nagravision/delivery"
+       for SOURCE in $release; do
+              if [[  "$SOURCE" != " " ]]; then
+                     SOURCE=`echo $SOURCE | sed 's"#"/"g'`
+                     SOURCE_path=`find /packager/delivery/Customers/ -mindepth 2 -maxdepth 3 -type d -name $SOURCE`
+		     log INFO "Copying $SOURCE_path on $target ......................."
+                     sshExe $clientIP "rsync -va --progress --exclude 'TL*' $SOURCE_path $target" 
+	      fi
+       done
+sshExe $clientIP  "cp $BASE/install.bat $target/install.bat"
+}
+
+LINUX_system () {
+HOST=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+CMD="sshExe"
+
+
+HOST_NAME=`$CMD $host " hostname"`
+if [ $? -eq 0 ]; then
+        NUMPROC=`$CMD $HOST "cat /proc/cpuinfo | grep \"physical id\" | sort | uniq | wc -l"`
+        MACHSERIAL=`$CMD $HOST "dmidecode -s system-serial-number | grep -v '#'"`
+        MANUFACTURER=`$CMD $HOST "dmidecode -s system-manufacturer | grep -v '#'"`
+        MODELTYPE=""
+        MODEL=`$CMD $HOST "dmidecode -s system-product-name | grep -v '#'"`
+        RAM_tot=`$CMD $HOST "grep MemTotal /proc/meminfo | cut -d':' -f2 | cut -d 'k' -f1"`
+        RAM_tot=`echo "$RAM_tot" | xargs`
+        RAM_tot=`expr $RAM_tot / 1000 / 1000`
+	NETCOUNT=`$CMD $HOST "/usr/share/drbl/bin/get-nic-devs | wc -l"`
+        NUMPROC=`echo "$NUMPROC" | xargs `
+        MACHSERIAL=`echo "$MACHSERIAL" | xargs`
+        MANUFACTURER=`echo "$MANUFACTURER" | xargs`
+        MODEL=`echo "$MODEL" | xargs`
+	DISKCOUNT=`$CMD $HOST "lsblk -o NAME -i -d -n -e 1,11 | wc -l"`
+fi
+
+
+
+}
+
+
+findCustACR () {
+if [ -z $customer ]; then
+log INFO "Getting customer name from Sharepoint"
+
+#check in progress page
+page="`wget -qO -   http://sysprod:W117JnAa@sharepoint.hq.k.grp/sites/salesandops/sysprod/Lists/Projects/In%20Progress.aspx`"
+
+array=($page)
+
+    cnt=0
+for el in "${array[@]}"; do
+        [[ $el == *"$salesOrder"* ]]  && position=$cnt && break
+        ((++cnt))
+done
+if [ $cnt -eq 0 ]; then
+#This means that the order is not yet in progress, so may be is scheduled right now
+        page="`wget -qO -   http://sysprod:W117JnAa@sharepoint.hq.k.grp/sites/salesandops/sysprod/Lists/Projects/Scheduled.aspx`"
+        array=($page)
+        for el in "${array[@]}"; do
+                [[ $el == *"$salesOrder"* ]]  && position=$cnt && break
+        done
+fi
+#Get following substring in array (is the hyphen)
+((++cnt))
+string2=`echo ${array[$cnt]}`
+#Get following substring in array (is the cust ACR)
+((++cnt))
+string3=`echo ${array[$cnt]} | awk -F "<" '{print $1}'`
+
+ACR=$string3
+else
+ACR=$customer
+fi
+}
+
+sendEmailHOTLINE () {
+log INFO "Sending email to HOTLINE about radmin Status"
+
+[[  -z $ACR ]] && findCustACR
+
+# compose the title string (retunr vars from the function above)
+
+title=`echo $salesOrder $string2 $string3`
+
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+sn=`sshExe $clientIP "dmidecode -s system-serial-number || echo 0"`
+from='sysprod_sw_delivery@nagra.com'
+mailto='hotline@nagra.com'
+#mailto='andrea.cristalli@nagra.com'
+cc='SystemProduction@nagra.com'
+subject="[ $title ] [ $hostname ]  Radmin Activation "
+body='<body><p style="display: inline-block;
+        outline: none;
+        cursor: pointer;
+        text-align: left;
+        text-decoration: none;
+        font: 14px/100% Arial, Helvetica, sans-serif;
+        padding: .1em 1em .15em;
+        -webkit-border-radius: .5em;
+        -moz-border-radius: .5em;
+        border-radius: .5em;
+"
+>Hello,<br /><br />
+The radmin license has been activated on the following host:
+<table style="border:#6495ed solid medium;border-collapse : collapse;width : 80%;outline: none;cursor: pointer;text-align: center;text-decoration: none;font: 14px/100% Arial, Helvetica, sans-serif; padding: .5em 2em .55em;">
+<tr><th  colspan="5"style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 5px;background-color : #d0e3fa;" >Sales Order: '$title'</th></tr>
+<tr><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 5px;background-color : #d0e3fa;" >Hostname
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Ip Address
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Serial number
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Image Version
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Radmin status</th></tr>
+<tr><td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$hostname'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$ipaddress'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$MACHSERIAL'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$taskID'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">Yes</td></tr>
+</table><br /><br />Best regards,<br /><br />
+Your SysProd Team<br /><br />
+This is an automatic report, any feedback welcome at the address SystemProduction[at]nagra.com</p></body></html>';
+
+
+( 
+echo "From: $from"
+echo "To: $mailto"
+echo "Cc: $cc"
+echo "Subject: $subject"
+echo "MIME-Version: 1.0"
+echo "Content-Type: text/html; charset=ISO-8859-1"
+echo "$body"
+) | sendmail -t
+
+}
+checkRack () {
+if [ $nocheck -eq 0 ]; then
+log INFO "Check if the client $rackPosition is reacheable..."
+RET=145
+#check valid client
+nimclient=`ssh 10.0.205.205 "lsnim -c machines | grep $rackPosition"`
+valid_ip $rackPosition
+ [[ -z "$nimclient" ]] &&  [ $ERROR -ne 0 ]   && log ERROR "Hey, this client doesn't exists ...! check your spelling" && exit 1
+ 
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+if [[ "$clientIP" != "" ]]; then
+	ping -c 1 $clientIP 2>&1 > /dev/null 
+	PING=$?
+	if [[ $PING -ne 0 ]] ; then
+		RET=144
+		log ERROR "I didn't found any pxe client at/on $rackPosition"
+	else
+		log INFO "Good! the client is a valid pxe client and it is well connected."
+	fi
+else
+	RET=144
+        log ERROR "I didn't found any pxe client at/on $rackPosition"
+fi
+fi
+nocheck=1
+}
+
+if [ $# -eq 0 ]; then
+usage
+fi
+
+#if only tw0 arguments are given we check the existance of this client
+if [ $# -eq 2 ]; then
+        rackPosition=$2
+        checkRack
+        exit $RET
+fi
+
+
+#Actually Get the arguments
+
+while :
+do
+    case "$1" in
+	-a )
+	  wintz="$2" # You may want to check validity of $2
+	  shift 2
+	  ;;
+	  -pos )
+	  rackPosition="$2" # You may want to check validity of $2
+	  shift 2
+	  ;;
+	  -g )
+	  gateway="$2"   # You may want to check validity of $2
+	  shift 2
+	  ;;
+      -h )
+	  hostname="$2"   # You may want to check validity of $2
+	  shift 2
+	  ;;
+      -d )
+	  domain="$2" 
+	  shift 2
+	  ;;
+      -t )
+	  taskID="$2"  
+	  shift 2
+	  ;;
+	  -ip )
+	  ipaddress="$2"  
+	  shift 2
+	  ;;
+      -n )
+	  netmask="$2" # You may want to check validity of $2
+	  shift 2
+	  ;;
+      -p )
+	  productKey="$2" # You may want to check validity of $2
+	  shift 2
+	  ;;
+	  -r )
+	  release="$2" # You may want to check validity of $2
+	  shift 2
+	  ;;
+	  -s )
+	  salesOrder="$2" # You may want to check validity of $2
+	  shift 2
+	  ;;
+	  -iloip )
+	  iloipaddress="$2"
+	  shift 2
+	  ;;
+	  -ilonm )
+	  ilonetmask="$2"
+	  shift 2
+	  ;;
+      -radmin )
+       radmin="$2"
+       shift 2
+        ;;
+	-cus )
+	customer=$2
+	shift 2
+	;;
+*)	break
+;;
+	   esac
+done
+
+
+#Gets environmental values from DB
+getEnv
+
+# check the arguments
+# Please note that data is not verified
+check_args
+checkRack
+if [ $RET -ne 145 ]; then
+	exit $RET
+fi
+
+log INFO "Set defaults value if not specified in command line..."
+# Set the defaults values
+[[ -z "$wintz" ]] && wintz="Central European Standard Time" 					&& log INFO "Set the time zone to '$wintz'"
+[[ -z "$hostname" ]] && hostname="mgt01"							&& log INFO "Set the hostname to '$hostname'"
+[[ -z "$domain" ]] && domain="WORKGROUP"							&& log INFO "Set the workgroup to '$domain'"
+[[ -z "$ipaddress" ]] && ipaddress=$(echo "10.0.133.$((RANDOM%=255))")				&& log INFO "Set the ip address to '$ipaddress'"
+[[ -z "$netmask" ]] && netmask="255.255.255.0"							&& log INFO "Set the netmask to '$netmask'"
+[[ -z "$gateway" ]] && gateway="10.0.133.252"							&& log INFO "Set the gateway to '$gateway'"
+[[ -z "$ilohostname" ]] && ilohostname="ILO$hostname"						&& log INFO "Assuming ilo hostname for proliant server equal to '$ilohostname' and IMM hostname for IBM X series equal to IMM$hostname"
+[[ -z "$iloipaddress" ]] && iloipaddress=$(echo "10.0.133.$((RANDOM%=255))")			&& log INFO "Assuming ilo ip address for proliant server equal to '$iloipaddress'"
+[[ -z "$ilonetmask" ]] && ilonetmask="255.255.255.0"						&& log INFO "Assuming ilo netmask for proliant server equal to '$ilonetmask'"
+[[ -z "$salesOrder" ]] && salesOrder="99999999"							&& log INFO "Set sales order to '$salesOrder'"
+[[ -z "$radmin" ]] &&  radmin=0									&& log INFO "Set radmin to 0 (not activate)"
+cz=0
+[[ ! -d "$MDT/$taskID" ]] && cz=1  
+
+log INFO "Executing the machine inventory"
+LINUX_system 
+if [[ $radmin -ne 0 ]]; then
+        sendEmailHOTLINE
+#echo "send email is commented"
+fi
+
+#Check if the workflow is mdt or clonezilla
+if [ $cz -eq 1 ]; then
+	#*********************************************	Clonezilla WORKFLOW	***************************************************
+	log INFO "Starting Clonezilla WORKFLOW"
+	log INFO "Creating the confnet.bat file for further customisation..."
+	createConfnet
+	# Config proliant servers
+	log INFO "Checking if the server is a proliant server...."
+	proliant=$(checkProliant)
+	if [[ "$proliant" == "OK" ]]; then
+		#Set ILO configuration
+		log INFO "Set the ILO ip"
+		setILO
+		#do the mirror!
+		log INFO "Creating the mirror if needed"
+		setProliantMirror
+	else
+		#check if a IBM server
+		log INFO "Checking if the server is a IBM server...."
+		IBM=$(checkIBM)
+		if [[ "$IBM" == "OK" ]]; then
+		#Apply raid configuration (mirror template)
+		log WARN "Did you set the raid yourself?"
+#		setIBMRaid "raid1.ini"	
+		fi
+	fi
+	log INFO "Launching the clonezilla restore in background"
+	clonezillaWrapper &
+
+
+else
+	#***********************************************	MDT WORKFLOW	****************************************************
+	#Append the section to customsettings.ini
+	log INFO "Starting MDT WORKFLOW"
+	log INFO "Creating CustomSettings.ini section for MDT..."
+	append_csini
+
+	#Create the boot files
+	log INFO "Creating bootfiles for grub and syslinux based on mac address"
+	bootPxe
+
+	# Create the Confnet file
+	log INFO "Creating the confnet.bat file for further customisation..."
+	createConfnet
+#	destroyDisks
+	# Config proliant servers
+	log INFO "Checking if the server is a proliant server...."
+	proliant=$(checkProliant)
+	if [[ "$proliant" == "OK" ]]; then
+        	#Set ILO configuration
+        	log INFO "Set the ILO ip"
+        	setILO
+        	#do the mirror!
+        	log INFO "Creating the mirror if needed"
+        	setProliantMirror
+		#clone WinPE on HDD
+#		clonePEonHDD &
+		destroyDisks
+	else
+		#check if a IBM server
+        	log INFO "Checking if the server is a IBM server...."
+        	IBM=$(checkIBM)
+        	if [[ "$IBM" == "OK" ]]; then
+        		log WARN "Did you set the raid yourself?"
+#               setIBMRaid "raid1.ini"
+		setIMM
+		else
+			#check if HP EliteDesk
+#			log INFO "Check if this is a EliteDesk desktop machine....."
+#			ELITE=$(checkEliteDesk)
+#			if [[ "$ELITE" == "OK" ]]; then
+        		#		clonePEonHDD &
+			log INFO "This is a standard machine or VM, cleaning the disk(s)"
+			destroyDisks
+#		fi
+		fi
+		#the SSH execution is assured in the function
+	fi
+	# Create the record in dashboard table
+	log INFO "Rebooting the client....."
+	log INFO "End of Wrapper execution. Next messages comes from MDT"
+                        sshExe $clientIP /sbin/reboot 2>&1 >/dev/null &
+exit 0
+fi
+# End of file
+exit 0
