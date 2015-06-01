@@ -1030,98 +1030,8 @@ fi
 }
 
 
-findCustACR () {
-if [ -z $customer ]; then
-log INFO "Getting customer name from Sharepoint"
-
-#check in progress page
-page="`wget -qO -   http://sysprod:W117JnAa@sharepoint.hq.k.grp/sites/salesandops/sysprod/Lists/Projects/In%20Progress.aspx`"
-
-array=($page)
-
-    cnt=0
-for el in "${array[@]}"; do
-        [[ $el == *"$salesOrder"* ]]  && position=$cnt && break
-        ((++cnt))
-done
-if [ $cnt -eq 0 ]; then
-#This means that the order is not yet in progress, so may be is scheduled right now
-        page="`wget -qO -   http://sysprod:W117JnAa@sharepoint.hq.k.grp/sites/salesandops/sysprod/Lists/Projects/Scheduled.aspx`"
-        array=($page)
-        for el in "${array[@]}"; do
-                [[ $el == *"$salesOrder"* ]]  && position=$cnt && break
-        done
-fi
-#Get following substring in array (is the hyphen)
-((++cnt))
-string2=`echo ${array[$cnt]}`
-#Get following substring in array (is the cust ACR)
-((++cnt))
-string3=`echo ${array[$cnt]} | awk -F "<" '{print $1}'`
-
-ACR=$string3
-else
-ACR=$customer
-fi
-}
-
-sendEmailHOTLINE () {
-log INFO "Sending email to HOTLINE about radmin Status"
-
-[[  -z $ACR ]] && findCustACR
-
-# compose the title string (retunr vars from the function above)
-
-title=`echo $salesOrder $string2 $string3`
-
-clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
-sn=`sshExe $clientIP "dmidecode -s system-serial-number || echo 0"`
-from='sysprod_sw_delivery@nagra.com'
-mailto='hotline@nagra.com'
-#mailto='andrea.cristalli@nagra.com'
-cc='SystemProduction@nagra.com'
-subject="[ $title ] [ $hostname ]  Radmin Activation "
-body='<body><p style="display: inline-block;
-        outline: none;
-        cursor: pointer;
-        text-align: left;
-        text-decoration: none;
-        font: 14px/100% Arial, Helvetica, sans-serif;
-        padding: .1em 1em .15em;
-        -webkit-border-radius: .5em;
-        -moz-border-radius: .5em;
-        border-radius: .5em;
-"
->Hello,<br /><br />
-The radmin license has been activated on the following host:
-<table style="border:#6495ed solid medium;border-collapse : collapse;width : 80%;outline: none;cursor: pointer;text-align: center;text-decoration: none;font: 14px/100% Arial, Helvetica, sans-serif; padding: .5em 2em .55em;">
-<tr><th  colspan="5"style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 5px;background-color : #d0e3fa;" >Sales Order: '$title'</th></tr>
-<tr><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 5px;background-color : #d0e3fa;" >Hostname
-</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Ip Address
-</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Serial number
-</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Image Version
-</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Radmin status</th></tr>
-<tr><td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$hostname'</td>
-<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$ipaddress'</td>
-<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$MACHSERIAL'</td>
-<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$taskID'</td>
-<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">Yes</td></tr>
-</table><br /><br />Best regards,<br /><br />
-Your SysProd Team<br /><br />
-This is an automatic report, any feedback welcome at the address SystemProduction[at]nagra.com</p></body></html>';
 
 
-( 
-echo "From: $from"
-echo "To: $mailto"
-echo "Cc: $cc"
-echo "Subject: $subject"
-echo "MIME-Version: 1.0"
-echo "Content-Type: text/html; charset=ISO-8859-1"
-echo "$body"
-) | sendmail -t
-
-}
 checkRack () {
 if [ $nocheck -eq 0 ]; then
 log INFO "Check if the client $rackPosition is reacheable..."
@@ -1261,10 +1171,7 @@ cz=0
 
 log INFO "Executing the machine inventory"
 LINUX_system 
-if [[ $radmin -ne 0 ]]; then
-        sendEmailHOTLINE
-#echo "send email is commented"
-fi
+
 
 #Check if the workflow is mdt or clonezilla
 if [ $cz -eq 1 ]; then
