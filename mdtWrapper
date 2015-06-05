@@ -3,8 +3,10 @@
 
 #
 #
-# mdtWrapper v 2.0
+# mdtWrapper v 1.7
+#
 # - Added ipxe configuration to boostrap from dhcpd directly
+# -Added time synchro part
 # ipxe boot script added the dispatcher part
 # This script is intended to be a wrapper for MDT and tftp server.
 # It runs on drbl server
@@ -13,14 +15,17 @@
 # The script can be run manually, it accepts a minimum of two arguments: 
 # - Task ID (as defined in mdt database)
 # - Rack position or directly the ip address of client (need to be know)
-# 
+# - Set the password in confnet script (even if there are no changes in values)
+# Changes:
+# 2015-06-01 Added support for prolinat GEN 9 (removed acu and added hpss)
+# 2015-06 Added sigkill at the end to avoid double execution
 # Debug:
 # code 299 no clients found on rack position declared
-# Author ACS 2014
+# Author ACS 2015
 
 
 #Source the DRBL functions dir
-
+My_Pid=$$
 DRBL_SCRIPT_PATH="${DRBL_SCRIPT_PATH:-/usr/share/drbl/bin}"
 
 #Define the web services where to send events
@@ -159,6 +164,21 @@ valid_ip $rackPosition
  #check valid TaskID
 ( [[ ! -d $MDT/$taskID ]] && [[ ! -d $BASE/$taskID ]] ) && log ERROR "The taskID $taskID is not valid, please check the name. Possible values are for MDT based jobs are:" && log INFO "`for dir in $(ls -d $MDT/*/);do echo $(basename $dir);done`" && log ERROR "And for clonezilla here you are the images available:" && log INFO "`for dir in $(ls -d $BASE/*/); do if [ -f $dir/disk ]; then echo $(basename $dir); fi; done`" && exit 1
 }
+
+syncTime () {
+step="Synching server time: "
+log INFO "$step current date is `date`"
+log INFO "$step stopping the ntp service..."
+service ntp stop
+log INFO "$step contacting the 10.0.205.204 server ..."
+ntpdate 10.0.205.204
+log INFO "$step setting the hardware clock to UTC"
+hwclock --systohc --utc
+
+
+}
+
+
 
 destroyDisks () {
 clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
@@ -675,7 +695,7 @@ net time \\\\mdt01 /SET /YES
 cscript /b %windir%\\system32\\slmgr.vbs -upk
 cscript /b %windir%\\system32\\slmgr.vbs -ipk $productKey
 cscript /b %windir%\\system32\\slmgr.vbs -ato
-
+ping 9.1.1.1 -n 1 -w 10000 > nul
 "
 
 fi
@@ -716,6 +736,8 @@ echo Installation number: $salesOrder performed on $data > C:\Windows\syp_log
 "
 fi
 confnetContent="$confnetContent
+net user administrator Superuser
+net user operator Customer
 DEL \"%~f0\"
 shutdown -r -t 190
 "
@@ -891,16 +913,16 @@ setProliantMirror () {
 clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
 #Check if there are two disks
 declare -i Disks
-Results=`sshExe $clientIP "hpacucli ctrl all  show config | grep physicaldrive | wc -l"`
+Results=`sshExe $clientIP "hpssacli ctrl all  show config | grep physicaldrive | wc -l"`
 Disks=$(echo $Results | sed 's/[^0-9]*//g')
 log INFO "Found $Disks physical disks on system"
 if [[ $Disks -eq 2 ]]; then
 log WARN "Building the mirror"
-Raid=$(sshExe $clientIP "hpacuscripting -reset -i /home/partimag/HPRAIDTEMPLATES/acuoutput1.ini")
-if [ $? -ne 0]; then
+Raid=$(sshExe $clientIP "hpssascripting -reset -i /home/partimag/HPRAIDTEMPLATES/hpssascripting1.ini")
+if [ $? -ne 0 ]; then
         ERR="`cat error.ini`"
         log WARN "The first applied template gives an error: $ERR . I'm going to apply the second one....."
-        Raid=$(sshExe $clientIP "hpacuscripting -reset -i /home/partimag/HPRAIDTEMPLATES/acuoutput2.ini")
+        Raid=$(sshExe $clientIP "hpssascripting -reset -i /home/partimag/HPRAIDTEMPLATES/acuoutput1.ini")
         if [ $? -ne 0]; then
                 log ERROR "I have two physical disks, but I could'nt build a mirror as asked. I'm exit right now"
 		exit 299
@@ -1030,8 +1052,98 @@ fi
 }
 
 
+findCustACR () {
+if [ -z $customer ]; then
+log INFO "Getting customer name from Sharepoint"
+
+#check in progress page
+page="`wget -qO -   http://sysprod:W117JnAa@sharepoint.hq.k.grp/sites/salesandops/sysprod/Lists/Projects/In%20Progress.aspx`"
+
+array=($page)
+
+    cnt=0
+for el in "${array[@]}"; do
+        [[ $el == *"$salesOrder"* ]]  && position=$cnt && break
+        ((++cnt))
+done
+if [ $cnt -eq 0 ]; then
+#This means that the order is not yet in progress, so may be is scheduled right now
+        page="`wget -qO -   http://sysprod:W117JnAa@sharepoint.hq.k.grp/sites/salesandops/sysprod/Lists/Projects/Scheduled.aspx`"
+        array=($page)
+        for el in "${array[@]}"; do
+                [[ $el == *"$salesOrder"* ]]  && position=$cnt && break
+        done
+fi
+#Get following substring in array (is the hyphen)
+((++cnt))
+string2=`echo ${array[$cnt]}`
+#Get following substring in array (is the cust ACR)
+((++cnt))
+string3=`echo ${array[$cnt]} | awk -F "<" '{print $1}'`
+
+ACR=$string3
+else
+ACR=$customer
+fi
+}
+
+sendEmailHOTLINE () {
+log INFO "Sending email to HOTLINE about radmin Status"
+
+[[  -z $ACR ]] && findCustACR
+
+# compose the title string (retunr vars from the function above)
+
+title=`echo $salesOrder $string2 $string3`
+
+clientIP=$(findIPMAC $rackPosition "IP" 2>/dev/null | head -1)
+sn=`sshExe $clientIP "dmidecode -s system-serial-number || echo 0"`
+from='sysprod_sw_delivery@nagra.com'
+mailto='hotline@nagra.com'
+#mailto='andrea.cristalli@nagra.com'
+cc='SystemProduction@nagra.com'
+subject="[ $title ] [ $hostname ]  Radmin Activation "
+body='<body><p style="display: inline-block;
+        outline: none;
+        cursor: pointer;
+        text-align: left;
+        text-decoration: none;
+        font: 14px/100% Arial, Helvetica, sans-serif;
+        padding: .1em 1em .15em;
+        -webkit-border-radius: .5em;
+        -moz-border-radius: .5em;
+        border-radius: .5em;
+"
+>Hello,<br /><br />
+The radmin license has been activated on the following host:
+<table style="border:#6495ed solid medium;border-collapse : collapse;width : 80%;outline: none;cursor: pointer;text-align: center;text-decoration: none;font: 14px/100% Arial, Helvetica, sans-serif; padding: .5em 2em .55em;">
+<tr><th  colspan="5"style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 5px;background-color : #d0e3fa;" >Sales Order: '$title'</th></tr>
+<tr><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 5px;background-color : #d0e3fa;" >Hostname
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Ip Address
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Serial number
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Image Version
+</th><th colspan="1" style="color : rgb(78, 191, 55);border : #6495ed solid thin;width : 50%;padding : 5px;background-color : #d0e3fa;" >Radmin status</th></tr>
+<tr><td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$hostname'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$ipaddress'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$MACHSERIAL'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">'$taskID'</td>
+<td style="border-style : solid;width : 20em;border : #6495ed solid thin;padding : 5px;text-align : center;background-color : #ffffff;">Yes</td></tr>
+</table><br /><br />Best regards,<br /><br />
+Your SysProd Team<br /><br />
+This is an automatic report, any feedback welcome at the address SystemProduction[at]nagra.com</p></body></html>';
 
 
+( 
+echo "From: $from"
+echo "To: $mailto"
+echo "Cc: $cc"
+echo "Subject: $subject"
+echo "MIME-Version: 1.0"
+echo "Content-Type: text/html; charset=ISO-8859-1"
+echo "$body"
+) | sendmail -t
+
+}
 checkRack () {
 if [ $nocheck -eq 0 ]; then
 log INFO "Check if the client $rackPosition is reacheable..."
@@ -1143,7 +1255,7 @@ done
 
 
 #Gets environmental values from DB
-getEnv
+valid_ip $rackPosition  || getEnv
 
 # check the arguments
 # Please note that data is not verified
@@ -1169,9 +1281,16 @@ log INFO "Set defaults value if not specified in command line..."
 cz=0
 [[ ! -d "$MDT/$taskID" ]] && cz=1  
 
+# Synch the time
+syncTime
+
+
 log INFO "Executing the machine inventory"
 LINUX_system 
-
+if [[ $radmin -ne 0 ]]; then
+   #     sendEmailHOTLINE
+echo "send email is commented"
+fi
 
 #Check if the workflow is mdt or clonezilla
 if [ $cz -eq 1 ]; then
@@ -1259,3 +1378,4 @@ exit 0
 fi
 # End of file
 exit 0
+kill $My_Pid
